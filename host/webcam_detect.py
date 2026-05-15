@@ -40,16 +40,26 @@ def preprocess(frame: np.ndarray) -> np.ndarray:
     return cv2.resize(bw, (28, 28), interpolation=cv2.INTER_AREA).flatten().astype(np.uint8)
 
 
-def infer_fpga(ser: serial.Serial, pixels: np.ndarray) -> tuple[int, float]:
-    """Send 784 bytes to FPGA, receive 1 byte result."""
+def infer_fpga(ser: serial.Serial, pixels: np.ndarray) -> tuple[int, float, float]:
+    """Send 784 bytes to FPGA, receive 1 byte result.
+    Returns (digit, total_ms, fpga_inference_ms).
+    UART TX cost: 784 bytes × 10 bits / baud (start+8data+stop).
+    """
+    uart_tx_ms = (784 * 10 / ser.baudrate) * 1000  # ~68 ms @ 115200
+    uart_rx_ms = (1   * 10 / ser.baudrate) * 1000  # ~0.09 ms
+
     ser.reset_input_buffer()
     t0 = time.perf_counter()
     ser.write(pixels.tobytes())
     resp = ser.read(1)
-    ms = (time.perf_counter() - t0) * 1000
+    total_ms = (time.perf_counter() - t0) * 1000
+
     if not resp:
         raise TimeoutError("No response — check FPGA is programmed and port is correct")
-    return resp[0], ms
+
+    # Subtract known UART overhead to isolate FPGA processing time
+    fpga_ms = max(0.0, total_ms - uart_tx_ms - uart_rx_ms)
+    return resp[0], total_ms, fpga_ms
 
 
 def main():
@@ -61,8 +71,9 @@ def main():
     args = ap.parse_args()
 
     try:
-        ser = serial.Serial(args.port, args.baud, timeout=args.timeout)
-        time.sleep(0.1)
+        ser = serial.Serial(args.port, args.baud, timeout=args.timeout,
+                            write_timeout=args.timeout)
+        time.sleep(0.5)  # give FPGA time to come out of reset
         print(f"Opened {args.port} at {args.baud} baud")
     except serial.SerialException as e:
         print(f"Serial error: {e}")
@@ -109,9 +120,9 @@ def main():
             break
         if key == ord(" "):
             try:
-                digit, ms = infer_fpga(ser, pixels)
-                overlay = f"Digit: {digit}  ({ms:.0f} ms)"
-                print(overlay)
+                digit, total_ms, fpga_ms = infer_fpga(ser, pixels)
+                overlay = f"Digit: {digit}  (FPGA: {fpga_ms:.1f} ms  total: {total_ms:.0f} ms)"
+                print(f"Digit: {digit}  FPGA inference: {fpga_ms:.1f} ms  (total round-trip: {total_ms:.0f} ms)")
             except TimeoutError as e:
                 overlay = "Timeout!"
                 print(e)
