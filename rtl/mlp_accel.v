@@ -1,19 +1,26 @@
-// mlp_accel.v — MNIST MLP Accelerator (784->64->32->10)
-// Single file: MAC + FSM + weight BRAMs loaded via $readmemh
+// mlp_accel.v — General-purpose MLP Accelerator
+// Parameterized: any 3-layer fully-connected network, any input size, any output classes.
 //
-// Critical path fix
-// -----------------
-// The original design computed BRAM addresses as nrn_ctr * L1_IN
-// (a 10x10-bit multiply) combinatorially — this was the ~14 MHz bottleneck.
-// Fix: maintain a registered base_addr that increments by L_IN each
-// time we move to a new neuron. BRAM address = base_addr + in_ctr.
-// No multiply on the critical path → clean 25 MHz timing.
+// Usage examples
+// --------------
+//   MNIST digit recognition  : L1_IN=784, L1_OUT=64, L2_OUT=32, L3_OUT=10
+//   Thermal human detection  : L1_IN=1024, L1_OUT=64, L2_OUT=32, L3_OUT=2
+//   Sensor anomaly detection : L1_IN=128,  L1_OUT=32, L2_OUT=16, L3_OUT=4
+//
+// To retarget: retrain in PyTorch, re-export hex files, update parameters at
+// instantiation. No RTL logic changes needed.
+//
+// Critical path note
+// ------------------
+// BRAM address = base_addr + in_ctr (registered accumulator, no multiply).
+// base_addr increments by L_IN at each STORE state → no wide multiplier on
+// the critical path → clean timing closure at 100 MHz on Artix-7.
 
 `default_nettype none
 `timescale 1ns/1ps
 
 // ============================================================================
-// Weight BRAM — no reset port, synchronous read → Yosys infers EBR cleanly
+// Weight BRAM — synchronous read, block RAM inferred via ram_style attribute
 // ============================================================================
 module weight_bram #(
     parameter DEPTH = 1024,
@@ -30,7 +37,9 @@ endmodule
 
 
 // ============================================================================
-// MAC — pipelined Q8.8 × Q4.12, 2-cycle latency
+// MAC — pipelined Q8.8 × Q4.12, 2-cycle latency, signed saturation
+// acc += (a × b) >> 4   on each enabled cycle
+// On clr: acc preloaded with bias_in << 8 (aligns Q8.8 bias to Q8.16 acc)
 // ============================================================================
 module mac (
     input  wire        clk, rst, clr, en,
@@ -71,19 +80,36 @@ endmodule
 
 
 // ============================================================================
-// MLP accelerator
+// MLP accelerator — fully parameterized 3-layer FC network
 // ============================================================================
-module mlp_accel (
+module mlp_accel #(
+    // ── Network topology ─────────────────────────────────────────────────────
+    parameter L1_IN  = 784,   // input size  (e.g. 784 for MNIST, 1024 for 32x32)
+    parameter L1_OUT = 64,    // hidden layer 1 neurons
+    parameter L2_IN  = 64,    // must equal L1_OUT
+    parameter L2_OUT = 32,    // hidden layer 2 neurons
+    parameter L3_IN  = 32,    // must equal L2_OUT
+    parameter L3_OUT = 10,    // output classes (e.g. 10 for MNIST, 2 for binary)
+
+    // ── Weight hex files ─────────────────────────────────────────────────────
+    parameter W1_HEX = "hex/weight_l1.hex",
+    parameter W2_HEX = "hex/weight_l2.hex",
+    parameter W3_HEX = "hex/weight_l3.hex",
+
+    // ── Bias hex files ───────────────────────────────────────────────────────
+    parameter B1_HEX = "hex/bias_l1.hex",
+    parameter B2_HEX = "hex/bias_l2.hex",
+    parameter B3_HEX = "hex/bias_l3.hex"
+)(
     input  wire        clk, rst, start,
     output reg         done,
-    output reg  [ 3:0] result,
-    output wire [ 9:0] pix_addr,
+    output reg  [ 3:0] result,          // argmax index (0 to L3_OUT-1)
+    output wire [$clog2(L1_IN)-1:0] pix_addr,
     input  wire [ 7:0] pix_data
 );
-    localparam L1_IN=784, L1_OUT=64, L2_IN=64, L2_OUT=32, L3_IN=32, L3_OUT=10;
-    localparam DRAIN=2;
+    localparam DRAIN = 2;
 
-    // ── FSM states ────────────────────────────────────────────────────────────
+    // ── FSM states (one-hot) ──────────────────────────────────────────────────
     localparam [17:0]
         S_IDLE     = 18'd1,    S_L1_PRE   = 18'd2,
         S_L1_PRE2  = 18'd4,    S_L1_MAC   = 18'd8,
@@ -96,29 +122,29 @@ module mlp_accel (
         S_ARGMAX   = 18'd65536,S_DONE     = 18'd131072;
 
     reg [17:0] state;
-    reg [ 9:0] nrn_ctr, in_ctr;
-    reg [ 1:0] drain_ctr;
 
-    // base_addr: registered accumulator — eliminates nrn*L_IN multiply
-    // Updated in STORE: base_addr += L_IN when moving to next neuron
+    // Counter widths derived from parameters
+    reg [$clog2(L1_OUT > L2_OUT ? (L1_OUT > L3_OUT ? L1_OUT : L3_OUT) :
+                                  (L2_OUT > L3_OUT ? L2_OUT : L3_OUT))-1:0] nrn_ctr;
+    reg [$clog2(L1_IN)-1:0]  in_ctr;
+    reg [1:0]                 drain_ctr;
+
+    // base_addr: registered accumulator — no multiply on critical path
     reg [16:0] base_addr;
 
-    // ── Bias memories (small — LUT RAM) ──────────────────────────────────────
+    // ── Bias memories (LUT RAM — small) ──────────────────────────────────────
     reg signed [15:0] b1_mem [0:L1_OUT-1];
     reg signed [15:0] b2_mem [0:L2_OUT-1];
     reg signed [15:0] b3_mem [0:L3_OUT-1];
     initial begin
-        $readmemh("hex/bias_l1.hex", b1_mem);
-        $readmemh("hex/bias_l2.hex", b2_mem);
-        $readmemh("hex/bias_l3.hex", b3_mem);
+        $readmemh(B1_HEX, b1_mem);
+        $readmemh(B2_HEX, b2_mem);
+        $readmemh(B3_HEX, b3_mem);
     end
 
     // ── Weight BRAMs ──────────────────────────────────────────────────────────
-    // Address = base_addr + in_ctr (simple add, no multiply)
-    // PRE/PRE2: fetch w[0] (in_ctr=0 at start of neuron)
-    // MAC[i]:   fetch w[i+1] (pre-fetch one ahead)
-    wire [16:0] w_addr_next = base_addr + {7'b0, in_ctr} + 17'd1;
-    wire [16:0] w_addr_cur  = base_addr;   // used in PRE/PRE2
+    wire [16:0] w_addr_next = base_addr + {{(17-$clog2(L1_IN)){1'b0}}, in_ctr} + 17'd1;
+    wire [16:0] w_addr_cur  = base_addr;
 
     reg [16:0] w_addr;
     always @(*) begin
@@ -126,21 +152,42 @@ module mlp_accel (
             S_L1_PRE, S_L1_PRE2,
             S_L2_PRE, S_L2_PRE2,
             S_L3_PRE, S_L3_PRE2: w_addr = w_addr_cur;
-            S_L1_MAC, S_L2_MAC, S_L3_MAC: w_addr = w_addr_next;
-            default: w_addr = 17'd0;
+            S_L1_MAC, S_L2_MAC,
+            S_L3_MAC:             w_addr = w_addr_next;
+            default:              w_addr = 17'd0;
         endcase
     end
 
     wire signed [15:0] w1_dout, w2_dout, w3_dout;
 
-    weight_bram #(.DEPTH(L1_OUT*L1_IN), .HEX("hex/weight_l1.hex")) u_w1 (
-        .clk(clk), .addr(w_addr[16:0]), .dout(w1_dout));
-    weight_bram #(.DEPTH(L2_OUT*L2_IN), .HEX("hex/weight_l2.hex")) u_w2 (
-        .clk(clk), .addr(w_addr[10:0]), .dout(w2_dout));
-    weight_bram #(.DEPTH(L3_OUT*L3_IN), .HEX("hex/weight_l3.hex")) u_w3 (
-        .clk(clk), .addr(w_addr[8:0]),  .dout(w3_dout));
+    weight_bram #(
+        .DEPTH(L1_OUT * L1_IN),
+        .HEX(W1_HEX)
+    ) u_w1 (
+        .clk(clk),
+        .addr(w_addr[$clog2(L1_OUT*L1_IN)-1:0]),
+        .dout(w1_dout)
+    );
 
-    // Select BRAM output based on current layer (registered)
+    weight_bram #(
+        .DEPTH(L2_OUT * L2_IN),
+        .HEX(W2_HEX)
+    ) u_w2 (
+        .clk(clk),
+        .addr(w_addr[$clog2(L2_OUT*L2_IN)-1:0]),
+        .dout(w2_dout)
+    );
+
+    weight_bram #(
+        .DEPTH(L3_OUT * L3_IN),
+        .HEX(W3_HEX)
+    ) u_w3 (
+        .clk(clk),
+        .addr(w_addr[$clog2(L3_OUT*L3_IN)-1:0]),
+        .dout(w3_dout)
+    );
+
+    // Select BRAM output based on current layer (registered to match BRAM latency)
     reg is_l1, is_l2;
     always @(posedge clk or posedge rst) begin
         if (rst) begin is_l1<=0; is_l2<=0; end
@@ -151,15 +198,18 @@ module mlp_accel (
     end
     wire signed [15:0] w_dout = is_l1 ? w1_dout : is_l2 ? w2_dout : w3_dout;
 
-    // Bias: combinatorial read (small LUT RAM, short path)
+    // Bias: combinatorial read from LUT RAM
     wire signed [31:0] b_now =
-        (state==S_L1_PRE2) ? {{16{b1_mem[nrn_ctr[5:0]][15]}}, b1_mem[nrn_ctr[5:0]]} :
-        (state==S_L2_PRE2) ? {{16{b2_mem[nrn_ctr[4:0]][15]}}, b2_mem[nrn_ctr[4:0]]} :
-                             {{16{b3_mem[nrn_ctr[3:0]][15]}}, b3_mem[nrn_ctr[3:0]]};
+        (state==S_L1_PRE2) ? {{16{b1_mem[nrn_ctr[$clog2(L1_OUT)-1:0]][15]}},
+                               b1_mem[nrn_ctr[$clog2(L1_OUT)-1:0]]} :
+        (state==S_L2_PRE2) ? {{16{b2_mem[nrn_ctr[$clog2(L2_OUT)-1:0]][15]}},
+                               b2_mem[nrn_ctr[$clog2(L2_OUT)-1:0]]} :
+                             {{16{b3_mem[nrn_ctr[$clog2(L3_OUT)-1:0]][15]}},
+                               b3_mem[nrn_ctr[$clog2(L3_OUT)-1:0]]};
 
     // ── Activation buffers ────────────────────────────────────────────────────
-    reg [15:0] act1 [0:L1_OUT-1];
-    reg [15:0] act2 [0:L2_OUT-1];
+    reg [15:0]        act1 [0:L1_OUT-1];
+    reg [15:0]        act2 [0:L2_OUT-1];
     reg signed [31:0] act3 [0:L3_OUT-1];
 
     // ── MAC ───────────────────────────────────────────────────────────────────
@@ -169,29 +219,33 @@ module mlp_accel (
     wire signed [31:0] mac_acc;
     wire               mac_valid;
 
-    mac u_mac (.clk(clk),.rst(rst),.clr(mac_clr),.en(mac_en),
-               .a(mac_a),.b(mac_b),.bias_in(mac_bias),
-               .acc_out(mac_acc),.valid_out(mac_valid));
+    mac u_mac (
+        .clk(clk), .rst(rst), .clr(mac_clr), .en(mac_en),
+        .a(mac_a), .b(mac_b), .bias_in(mac_bias),
+        .acc_out(mac_acc), .valid_out(mac_valid)
+    );
 
-    // ── ReLU ─────────────────────────────────────────────────────────────────
+    // ── ReLU ──────────────────────────────────────────────────────────────────
     localparam signed [31:0] SAT_LIM = 32'sh007FFF00;
     wire [15:0] relu_out =
-        (mac_acc<=32'sd0) ? 16'h0000 :
-        (mac_acc>SAT_LIM) ? 16'h7FFF : mac_acc[23:8];
+        (mac_acc <= 32'sd0) ? 16'h0000 :
+        (mac_acc >  SAT_LIM) ? 16'h7FFF : mac_acc[23:8];
 
-    // ── Argmax ────────────────────────────────────────────────────────────────
-    reg [3:0] argmax_idx;
+    // ── Argmax (combinatorial over L3_OUT outputs) ────────────────────────────
+    reg [3:0]         argmax_idx;
     reg signed [31:0] argmax_val;
     integer ai;
     always @(*) begin : argmax_comb
-        argmax_val=act3[0]; argmax_idx=4'd0;
-        for(ai=1;ai<L3_OUT;ai=ai+1)
-            if(act3[ai]>argmax_val) begin
-                argmax_val=act3[ai]; argmax_idx=ai[3:0];
+        argmax_val = act3[0];
+        argmax_idx = 4'd0;
+        for (ai = 1; ai < L3_OUT; ai = ai + 1)
+            if (act3[ai] > argmax_val) begin
+                argmax_val = act3[ai];
+                argmax_idx = ai[3:0];
             end
     end
 
-    assign pix_addr = in_ctr[9:0];
+    assign pix_addr = in_ctr[$clog2(L1_IN)-1:0];
 
     // ── FSM ───────────────────────────────────────────────────────────────────
     always @(posedge clk or posedge rst) begin
@@ -213,17 +267,19 @@ module mlp_accel (
             S_L1_PRE:  begin in_ctr<=0; state<=S_L1_PRE2; end
             S_L1_PRE2: begin mac_clr<=1; mac_bias<=b_now; state<=S_L1_MAC; end
             S_L1_MAC: begin
-                mac_en<=1; mac_a<={8'b0,pix_data}; mac_b<=w_dout;
-                if (in_ctr==L1_IN-1) begin drain_ctr<=0; state<=S_L1_DRAIN; end
-                else in_ctr<=in_ctr+1;
+                mac_en<=1;
+                mac_a <= {8'b0, pix_data};
+                mac_b <= w_dout;
+                if (in_ctr == L1_IN-1) begin drain_ctr<=0; state<=S_L1_DRAIN; end
+                else in_ctr <= in_ctr + 1;
             end
             S_L1_DRAIN: begin
-                drain_ctr<=drain_ctr+1;
-                if (drain_ctr==DRAIN-1) state<=S_L1_STORE;
+                drain_ctr <= drain_ctr + 1;
+                if (drain_ctr == DRAIN-1) state <= S_L1_STORE;
             end
             S_L1_STORE: begin
-                act1[nrn_ctr]<=relu_out;
-                if (nrn_ctr==L1_OUT-1) begin
+                act1[nrn_ctr[$clog2(L1_OUT)-1:0]] <= relu_out;
+                if (nrn_ctr == L1_OUT-1) begin
                     nrn_ctr<=0; in_ctr<=0; base_addr<=0; state<=S_L2_PRE;
                 end else begin
                     nrn_ctr<=nrn_ctr+1; in_ctr<=0;
@@ -235,17 +291,19 @@ module mlp_accel (
             S_L2_PRE:  begin in_ctr<=0; state<=S_L2_PRE2; end
             S_L2_PRE2: begin mac_clr<=1; mac_bias<=b_now; state<=S_L2_MAC; end
             S_L2_MAC: begin
-                mac_en<=1; mac_a<=$signed({1'b0,act1[in_ctr[5:0]]}); mac_b<=w_dout;
-                if (in_ctr==L2_IN-1) begin drain_ctr<=0; state<=S_L2_DRAIN; end
-                else in_ctr<=in_ctr+1;
+                mac_en<=1;
+                mac_a <= $signed({1'b0, act1[in_ctr[$clog2(L2_IN)-1:0]]});
+                mac_b <= w_dout;
+                if (in_ctr == L2_IN-1) begin drain_ctr<=0; state<=S_L2_DRAIN; end
+                else in_ctr <= in_ctr + 1;
             end
             S_L2_DRAIN: begin
-                drain_ctr<=drain_ctr+1;
-                if (drain_ctr==DRAIN-1) state<=S_L2_STORE;
+                drain_ctr <= drain_ctr + 1;
+                if (drain_ctr == DRAIN-1) state <= S_L2_STORE;
             end
             S_L2_STORE: begin
-                act2[nrn_ctr]<=relu_out;
-                if (nrn_ctr==L2_OUT-1) begin
+                act2[nrn_ctr[$clog2(L2_OUT)-1:0]] <= relu_out;
+                if (nrn_ctr == L2_OUT-1) begin
                     nrn_ctr<=0; in_ctr<=0; base_addr<=0; state<=S_L3_PRE;
                 end else begin
                     nrn_ctr<=nrn_ctr+1; in_ctr<=0;
@@ -257,26 +315,28 @@ module mlp_accel (
             S_L3_PRE:  begin in_ctr<=0; state<=S_L3_PRE2; end
             S_L3_PRE2: begin mac_clr<=1; mac_bias<=b_now; state<=S_L3_MAC; end
             S_L3_MAC: begin
-                mac_en<=1; mac_a<=$signed({1'b0,act2[in_ctr[4:0]]}); mac_b<=w_dout;
-                if (in_ctr==L3_IN-1) begin drain_ctr<=0; state<=S_L3_DRAIN; end
-                else in_ctr<=in_ctr+1;
+                mac_en<=1;
+                mac_a <= $signed({1'b0, act2[in_ctr[$clog2(L3_IN)-1:0]]});
+                mac_b <= w_dout;
+                if (in_ctr == L3_IN-1) begin drain_ctr<=0; state<=S_L3_DRAIN; end
+                else in_ctr <= in_ctr + 1;
             end
             S_L3_DRAIN: begin
-                drain_ctr<=drain_ctr+1;
-                if (drain_ctr==DRAIN-1) state<=S_L3_STORE;
+                drain_ctr <= drain_ctr + 1;
+                if (drain_ctr == DRAIN-1) state <= S_L3_STORE;
             end
             S_L3_STORE: begin
-                act3[nrn_ctr]<=mac_acc;
-                if (nrn_ctr==L3_OUT-1) state<=S_ARGMAX;
+                act3[nrn_ctr[$clog2(L3_OUT)-1:0]] <= mac_acc;
+                if (nrn_ctr == L3_OUT-1) state <= S_ARGMAX;
                 else begin
                     nrn_ctr<=nrn_ctr+1; in_ctr<=0;
                     base_addr<=base_addr+L3_IN; state<=S_L3_PRE;
                 end
             end
 
-            S_ARGMAX: begin result<=argmax_idx; state<=S_DONE; end
-            S_DONE:   begin done<=1; state<=S_IDLE; end
-            default:  state<=S_IDLE;
+            S_ARGMAX: begin result <= argmax_idx; state <= S_DONE; end
+            S_DONE:   begin done <= 1; state <= S_IDLE; end
+            default:  state <= S_IDLE;
             endcase
         end
     end
