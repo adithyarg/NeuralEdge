@@ -76,11 +76,11 @@ endmodule
 module mlp_accel (
     input  wire        clk, rst, start,
     output reg         done,
-    output reg  [ 3:0] result,
+    output reg  [ 1:0] result,
     output wire [ 9:0] pix_addr,
     input  wire [ 7:0] pix_data
 );
-    localparam L1_IN=784, L1_OUT=64, L2_IN=64, L2_OUT=32, L3_IN=32, L3_OUT=10;
+    localparam L1_IN=1024, L1_OUT=64, L2_IN=64, L2_OUT=32, L3_IN=32, L3_OUT=2;
     localparam DRAIN=2;
 
     // ── FSM states ────────────────────────────────────────────────────────────
@@ -108,9 +108,9 @@ module mlp_accel (
     reg signed [15:0] b2_mem [0:L2_OUT-1];
     reg signed [15:0] b3_mem [0:L3_OUT-1];
     initial begin
-        $readmemh("hex/bias_l1.hex", b1_mem);
-        $readmemh("hex/bias_l2.hex", b2_mem);
-        $readmemh("hex/bias_l3.hex", b3_mem);
+        $readmemh("hex/thermal/bias_l1.hex", b1_mem);
+        $readmemh("hex/thermal/bias_l2.hex", b2_mem);
+        $readmemh("hex/thermal/bias_l3.hex", b3_mem);
     end
 
     // ── Weight BRAMs ──────────────────────────────────────────────────────────
@@ -133,11 +133,11 @@ module mlp_accel (
 
     wire signed [15:0] w1_dout, w2_dout, w3_dout;
 
-    weight_bram #(.DEPTH(L1_OUT*L1_IN), .HEX("hex/weight_l1.hex")) u_w1 (
+    weight_bram #(.DEPTH(L1_OUT*L1_IN), .HEX("hex/thermal/weight_l1.hex")) u_w1 (
         .clk(clk), .addr(w_addr[16:0]), .dout(w1_dout));
-    weight_bram #(.DEPTH(L2_OUT*L2_IN), .HEX("hex/weight_l2.hex")) u_w2 (
+    weight_bram #(.DEPTH(L2_OUT*L2_IN), .HEX("hex/thermal/weight_l2.hex")) u_w2 (
         .clk(clk), .addr(w_addr[10:0]), .dout(w2_dout));
-    weight_bram #(.DEPTH(L3_OUT*L3_IN), .HEX("hex/weight_l3.hex")) u_w3 (
+    weight_bram #(.DEPTH(L3_OUT*L3_IN), .HEX("hex/thermal/weight_l3.hex")) u_w3 (
         .clk(clk), .addr(w_addr[8:0]),  .dout(w3_dout));
 
     // Select BRAM output based on current layer (registered)
@@ -155,7 +155,7 @@ module mlp_accel (
     wire signed [31:0] b_now =
         (state==S_L1_PRE2) ? {{16{b1_mem[nrn_ctr[5:0]][15]}}, b1_mem[nrn_ctr[5:0]]} :
         (state==S_L2_PRE2) ? {{16{b2_mem[nrn_ctr[4:0]][15]}}, b2_mem[nrn_ctr[4:0]]} :
-                             {{16{b3_mem[nrn_ctr[3:0]][15]}}, b3_mem[nrn_ctr[3:0]]};
+                             {{16{b3_mem[nrn_ctr[0]][15]}},   b3_mem[nrn_ctr[0]]};
 
     // ── Activation buffers ────────────────────────────────────────────────────
     reg [15:0] act1 [0:L1_OUT-1];
@@ -180,14 +180,14 @@ module mlp_accel (
         (mac_acc>SAT_LIM) ? 16'h7FFF : mac_acc[23:8];
 
     // ── Argmax ────────────────────────────────────────────────────────────────
-    reg [3:0] argmax_idx;
+    reg [1:0] argmax_idx;
     reg signed [31:0] argmax_val;
     integer ai;
     always @(*) begin : argmax_comb
-        argmax_val=act3[0]; argmax_idx=4'd0;
+        argmax_val=act3[0]; argmax_idx=2'd0;
         for(ai=1;ai<L3_OUT;ai=ai+1)
             if(act3[ai]>argmax_val) begin
-                argmax_val=act3[ai]; argmax_idx=ai[3:0];
+                argmax_val=act3[ai]; argmax_idx=ai[1:0];
             end
     end
 

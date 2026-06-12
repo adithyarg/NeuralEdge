@@ -11,17 +11,25 @@ vivado_proj/
 *.sim/
 
 # Build artefacts
-build/*.bit
-build/*.config
-build/*.json
-build/*.dcp
-build/*.rpt
+build/
 
 # Python
 __pycache__/
 *.pyc
 *.pyo
 
-# Training data and model weights (large files)
+# Training data (large — download separately)
 training/data/
+training/thermal/data/
+
+# Model weights (regenerate via training scripts)
 training/weights/
+training/thermal/weights/
+
+# MNIST hex files (not used in NeuralEdge thermal build)
+rtl/hex/bias_l1.hex
+rtl/hex/bias_l2.hex
+rtl/hex/bias_l3.hex
+rtl/hex/weight_l1.hex
+rtl/hex/weight_l2.hex
+rtl/hex/weight_l3.hex

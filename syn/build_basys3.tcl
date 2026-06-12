@@ -8,7 +8,7 @@ set top          "top_basys3"
 
 # Paths relative to the NN_Digits/ directory
 set rtl_dir  "rtl"
-set hex_dir  "rtl/hex"
+set hex_dir  "rtl/hex/thermal"
 set syn_dir  "syn"
 set out_dir  "build"
 
@@ -40,8 +40,8 @@ add_files -fileset constrs_1 $syn_dir/basys3.xdc
 
 set_property top $top [current_fileset]
 
-# Synthesise
-synth_design -top $top -part $part -include_dirs $hex_dir
+# Synthesise — include both hex dirs so $readmemh resolves correctly
+synth_design -top $top -part $part -include_dirs [list $hex_dir "rtl/hex"]
 write_checkpoint -force $out_dir/post_synth.dcp
 
 # Implement
