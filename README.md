@@ -1,6 +1,6 @@
 # NeuralEdge — FPGA AI Co-Processor
 
-A low-cost, low-power FPGA-based neural network inference accelerator targeting real-time AI on embedded systems. Built on the Digilent Basys3 (Xilinx Artix-7 XC7A35T), NeuralEdge offloads MLP inference from the host CPU, running under **500 mW** at a bill-of-materials cost under **₹1,250**.
+A low-cost, low-power FPGA-based neural network inference accelerator targeting real-time AI on embedded systems. Built on the Digilent Basys3 (Xilinx Artix-7 XC7A35T), NeuralEdge offloads MLP inference from the host CPU, running under **500 mW** at a bill-of-materials low cost.
 
 The accelerator is demonstrated with two applications:
 - **MNIST digit recognition** — 784-input, 94% accuracy, ~0.1 ms inference
